@@ -1,0 +1,11 @@
+google-adk
+google-cloud-storage
+google-cloud-vision
+pymupdf
+fastapi
+google-cloud-speech
+pydub
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
