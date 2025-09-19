@@ -10,13 +10,16 @@ import logging
 from fastapi import HTTPException
 
 
+
 load_dotenv()
 
+# logger=logging.getLogger("google.adk").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 storage_client = storage.Client()
 vision_client = vision.ImageAnnotatorClient()
- 
+
+
 def process_document(bucket_name: str, file_paths: list[str]) -> dict:
     """
     Extracts text content from PDF documents in GCS using Cloud Vision.
@@ -27,6 +30,8 @@ def process_document(bucket_name: str, file_paths: list[str]) -> dict:
         dict: { "extracted_documents": [{ "file": str, "content": str }] }
     """
     all_texts = []
+
+    print("I am in processing document task")
  
     for blob_name in file_paths:
         bucket = storage_client.bucket(bucket_name)
@@ -47,6 +52,10 @@ def process_document(bucket_name: str, file_paths: list[str]) -> dict:
             print(f"pdf_extracted:",{extracted_text})
         elif blob_name.lower().endswith(".txt"):
             extracted_text = blob.download_as_text()
+        elif blob_name.lower().endswith((".ppt", ".pptx")):
+            file_bytes = blob.download_as_bytes()
+            extracted_text = extract_text_from_ppt(file_bytes)
+            print(f"ppt_extracted:", {extracted_text})
         else:
             extracted_text = f"[Unsupported file type: {blob_name}]"
  
@@ -80,7 +89,50 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return text
 
 
+def extract_text_from_ppt(ppt_bytes: bytes) -> str:
+    """
+    Extract text from PPT/PPTX using Vision API.
+    Each slide is converted to an image (basic rendering) and OCR is applied.
+    """
+    temp_file = NamedTemporaryFile(suffix=".pptx", delete=False)
+    try:
+        temp_file.write(ppt_bytes)
+        temp_file.flush()
 
+        prs = Presentation(temp_file.name)
+        text = ""
+
+        for slide_num, slide in enumerate(prs.slides, start=1):
+            # Create blank image for slide
+            img = Image.new("RGB", (1280, 720), "white")
+            draw = ImageDraw.Draw(img)
+
+            y = 50
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    draw.text((50, y), shape.text, fill="black")
+                    y += 40
+
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format="PNG")
+            img_bytes = img_byte_arr.getvalue()
+
+            # Vision API OCR
+            image = vision.Image(content=img_bytes)
+            response = vision_client.document_text_detection(image=image)
+
+            if response.error.message:
+                logger.error(f"Vision API error on slide {slide_num}: {response.error.message}")
+                continue
+
+            text += f"\n--- Slide {slide_num} ---\n"
+            text += response.full_text_annotation.text + "\n"
+
+        return text.strip()
+
+    finally:
+        temp_file.close()
+        os.unlink(temp_file.name)
 
 
 def transcribe_audio(blob) -> str:

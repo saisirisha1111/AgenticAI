@@ -1,25 +1,29 @@
 import os
+import re
 import tempfile
 import asyncio
-import pickle
-import base64
+# import base64
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from google.cloud import storage
-from google.adk.agents import Agent
+from google.adk.agents import Agent, SequentialAgent
 import google.adk as adk
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 # from tools.processing_tool import process_document
 from Backend.tools.processing_tool import process_document
-# from ..tools.email_extraction_tool import check_email_inbox
-from Backend.tools.email_extraction_tool import check_email_inbox
+# from Backend.tools.email_extraction_tool import check_email_inbox
 from fastapi.middleware.cors import CORSMiddleware  
 import json
+import logging
 
+# ===== Logging Setup =====
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pipeline_logger")
+# logger=logging.getLogger("google.adk").setLevel(logging.DEBUG)
 
-
+# router = APIRouter()
 
 
 
@@ -37,21 +41,11 @@ class DocRequest(BaseModel):
 # ===== System Instruction =====
 instruction = """
 You are a Data Ingestion and Structuring Agent for startup evaluation.
-
+ 
 Tasks:
-1. If the user provides **only documents**, you MUST call the `process_document` tool with:
-   {"bucket_name": "...", "file_paths": ["..."]}
-
-2. If the user provides **only a founder email**, you MUST call the `email_extraction` tool with:
-   {"founder_email": "..."}
-
-3. If the user provides **both documents and a founder email**, you MUST call both tools:
-   - First call `process_document` for the files.
-   - Then call `email_extraction` for the founder’s email.
-   - Combine the extracted text from both sources.
-
-4. After getting the extracted text, analyze it and produce JSON strictly in this schema:
-
+1. You MUST call the `process_document` tool with the input {"bucket_name": "...", "file_paths": ["..."]}.
+2. Then analyze text and Output must be *only* valid JSON without Markdown or extra text with this schema:
+ 
 {
   "startup_name": "string or null",
   "traction": {
@@ -77,37 +71,178 @@ Tasks:
     "target_market": "string or null"
   },
   "product_description": "string or null",
-  "document_type": "pitch_deck | transcript | financial_statement | email_thread | other"
+  "document_type": "pitch_deck | transcript | financial_statement | other"
 }
-
+ 
 Rules:
-- Always ground responses on the extracted text only.
-- Do not hallucinate values.
-- Extract numbers exactly.
-- Use null if data is missing.
+- No hallucinations.
+- Numbers extracted exactly.
+- Missing = null.
 - Final output must be valid JSON only.
 """
 
 
 # ===== Define the Agent =====
-root_agent = Agent(
+doc_ingest_agent  = Agent(
     name="doc_ingest_agent",
     model="gemini-2.0-flash",
     instruction=instruction,
-    tools=[process_document,check_email_inbox],
+    tools=[process_document],
 )
 
-# ===== Session Service =====
+
+
+# recommendation_instruction = """
+# You are the Recommendation & Scoring Agent.
+
+# Role:
+# - The final judge. You take the structured JSON data from the Ingestion Agent.
+# - Apply scoring logic and generate a deal memo for investors.
+
+# Steps:
+# 1. Parse the structured JSON input.
+# 2. Score the startup on:
+#    - Traction (/10)
+#    - Team (/10)
+#    - Market (/10)
+#    - Product (/10)
+# 3. Apply weighted scoring (weights will be provided in input, otherwise default = Team: 0.3, Market: 0.2, Traction: 0.35, Product: 0.15).
+# 4. Output a final recommendation:
+#    - Verdict: Strong Pass | Pass | Weak Pass | Fail
+#    - Rationale: clear strengths and weaknesses
+#    - Recommendation: next steps
+
+# Output Format Example:
+
+# It tasks the Recommendation Agent with scoring.
+
+# Recommendation Agent scores:
+# Traction: 8/10 (strong growth, high valuation), 
+# Team: 9/10, 
+# Market: 6/10 (TAM inflated), 
+# Product: 7/10.
+
+# Applying the custom weights: (8*0.35) + (9*0.3) + (6*0.2) + (7*0.15) = 7.85/10
+
+# Final Generative Output (The AI Analyst's Memo):
+# **Startup X: Deal Memo**
+# **Verdict: Weak Pass (Score: 7.85/10)**
+# **Strengths:** Exceptional founding team with relevant pedigree and exit. Demonstrated strong initial MRR growth (50% MoM).
+# **Risks & Weaknesses:** Market size is significantly inflated; realistic SAM is $5B. Pre-money valuation ask is 2x sector average for this stage. Minor data inconsistency between deck and call on MRR.
+# **Recommendation:** Schedule a follow-up call to clarify market sizing assumptions and negotiate valuation down to $6-7M pre-money. Due diligence should focus on customer churn metrics.
+# """
+
+recommendation_instruction = """
+You are the Recommendation & Scoring Agent.
+
+Role:
+- The final judge. You take the structured JSON data from the Ingestion Agent.
+- Apply scoring logic and generate a deal memo for investors.
+
+Steps:
+1. Parse the structured JSON input.
+2. Score the startup on:
+   - Traction (/10)
+   - Team (/10)
+   - Market (/10)
+   - Product (/10)
+3. Apply weighted scoring (weights will be provided in input, otherwise default = Team: 0.3, Market: 0.2, Traction: 0.35, Product: 0.15).
+4. Output a final recommendation:
+   - Verdict: Strong Pass | Pass | Weak Pass | Fail
+   - Rationale: clear strengths and weaknesses
+   - Recommendation: next steps
+
+Output Format Example:
+
+{
+  "response": {
+    "Traction": "8/10 (strong growth, high valuation)",
+    "Team": "9/10 (experienced founders with exits)",
+    "Market": "6/10 (TAM inflated)",
+    "Product": "7/10 (clear value proposition)",
+    "Weighted_Score": "7.85/10",
+    "Verdict": "Weak Pass",
+    "Strengths": "Exceptional founding team with relevant pedigree and exit. Strong MRR growth.",
+    "Risks": "Market size inflated; valuation ask is above average.",
+    "Recommendation": "Schedule follow-up call to clarify assumptions and negotiate valuation."
+  }
+}
+"""
+
+
+recommendation_agent = Agent(
+    name="recommendation_agent",
+    model="gemini-2.0-flash",
+    instruction=recommendation_instruction
+)
+
+# ===== Sequential Pipeline =====
+pipeline = SequentialAgent(
+    name="analysis_pipeline",
+    description=(
+        "This pipeline runs in two steps:\n"
+        "1. The first agent (doc_ingest_agent) ONLY extracts and structures startup data into valid JSON.\n"
+        "   It must NOT provide analysis, scoring, or recommendation.\n"
+        "2. The second agent (recommendation_agent) ALWAYS takes that JSON as input and generates "
+        "   scoring, a final recommendation, and a short memo.\n"
+        "The pipeline is complete only after the second agent produces its output."
+    ),
+    sub_agents=[doc_ingest_agent, recommendation_agent],
+)
+
+# ===== Runner =====
 session_service = InMemorySessionService()
-app_name = "doc_app"
-user_id = "user123"
-session_id = "session1"
+runner = adk.Runner(agent=pipeline, app_name="startup_app", session_service=session_service)
+
+
+
+# ===== Pipeline Runner Function =====
+async def run_pipeline(file_json: dict):
+
+    await session_service.create_session(
+        app_name="startup_app",
+        user_id="user123",
+        session_id="session1"
+    )
+
+    content = types.Content(role="user", parts=[types.Part(text=json.dumps(file_json))])
+    print(content)
+    final_output = None  # 👈 hold last agent output
+
+    async for event in runner.run_async(
+        user_id="user123",
+        session_id="session1",
+        new_message=content
+    ):
+     
+        if not event.content or not event.content.parts:
+            continue
+        # print(event.content.parts)
+        for part in event.content.parts:         
+            if part.text:
+                raw_text = part.text.strip()
+                cleaned_text = re.sub(r"^```json\s*|\s*```$", "", raw_text, flags=re.MULTILINE)
+                logger.info(f"[{getattr(event, 'source_agent', 'unknown')}] TEXT: {cleaned_text}")
+                final_output = cleaned_text
+
+            elif part.function_call:
+                logger.info(
+                    f"[{getattr(event, 'source_agent', 'unknown')}] TOOL CALL: "
+                    f"{part.function_call.name}({part.function_call.args})"
+                )
+
+    # after loop ends, final_output will be from the *last agent*
+    if not final_output:
+        return {"error": "Pipeline returned no output"}
+
+    try:
+        # Try parsing JSON (for rec agent you expect text, so this will fail safely)
+        return json.loads(final_output)
+    except json.JSONDecodeError:
+        return {"report": final_output}
 
 # ===== FastAPI App =====
-app = FastAPI(title="Doc Ingestion Agent API")
-
-
-
+app = FastAPI(title="Doc Ingestion + Recommendation API")
 
 # ===== Enable CORS =====
 app.add_middleware(
@@ -118,18 +253,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("startup")
-async def startup_event():
-    await session_service.create_session(
-        app_name=app_name, user_id=user_id, session_id=session_id
-    )
-
-@app.post("/upload-and-analyze")
-async def upload_and_analyze(
+@app.post("/full-analysis")
+async def full_analysis(
     files: list[UploadFile],
-    user_email: str = Form(...),
-    founder_email: str | None = Form(None)   # 👈 optional founder email
+    founder_email: str = Form(...),
+    # founder_email: str | None = Form(None)   # 👈 optional founder email
 ):
     """
     Uploads files to GCS, constructs request for the Agent, 
@@ -140,7 +268,7 @@ async def upload_and_analyze(
     bucket = storage_client.bucket(BUCKET_NAME)
 
     for file in files:
-        blob_name = f"{user_email}/{file.filename}"
+        blob_name = f"{founder_email}/{file.filename}"
         blob = bucket.blob(blob_name)
 
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
@@ -155,20 +283,10 @@ async def upload_and_analyze(
     # Build agent input
     payload = {
         "bucket_name": BUCKET_NAME,
-        "file_paths": file_paths
+        "file_paths": file_paths,
+        # "founder_email": founder_email
     }
 
-    # If founder_email is provided, include it
-    if founder_email:
-        payload["founder_email"] = founder_email
+    result = await run_pipeline(payload)
 
-    req_json = json.dumps(payload)
-
-    runner = adk.Runner(agent=root_agent, app_name=app_name, session_service=session_service)
-    content = types.Content(role="user", parts=[types.Part(text=req_json)])
-
-    async for event in runner.run_async(
-        user_id=user_id, session_id=session_id, new_message=content
-    ):
-        if event.is_final_response():
-            return JSONResponse(content={"response": event.content.parts[0].text})
+    return JSONResponse(content={"response": result})

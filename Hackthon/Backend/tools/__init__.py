@@ -1,2 +1,1 @@
 from .processing_tool import process_document
-from .email_extraction_tool import check_email_inbox
