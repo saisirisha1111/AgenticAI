@@ -16,6 +16,7 @@
 import abc
 import inspect
 import io
+import json
 import logging
 import os
 import sys
@@ -37,8 +38,6 @@ from typing import (
     Union,
 )
 
-import proto
-
 from google.api_core import exceptions
 from google.cloud import storage
 from google.cloud.aiplatform import base
@@ -47,6 +46,9 @@ from google.cloud.aiplatform import utils as aip_utils
 from google.cloud.aiplatform_v1 import types as aip_types
 from google.cloud.aiplatform_v1.types import reasoning_engine_service
 from vertexai.agent_engines import _utils
+import httpx
+import proto
+
 from google.protobuf import field_mask_pb2
 
 
@@ -60,6 +62,9 @@ _STANDARD_API_MODE = ""
 _ASYNC_API_MODE = "async"
 _STREAM_API_MODE = "stream"
 _ASYNC_STREAM_API_MODE = "async_stream"
+_BIDI_STREAM_API_MODE = "bidi_stream"
+_A2A_EXTENSION_MODE = "a2a_extension"
+_A2A_AGENT_CARD = "a2a_agent_card"
 _MODE_KEY_IN_SCHEMA = "api_mode"
 _METHOD_NAME_KEY_IN_SCHEMA = "name"
 _DEFAULT_METHOD_NAME = "query"
@@ -111,6 +116,32 @@ try:
 except (ImportError, AttributeError):
     ADKAgent = None
 
+try:
+    from a2a.types import (
+        AgentCard,
+        TransportProtocol,
+        Message,
+        TaskIdParams,
+        TaskQueryParams,
+    )
+    from a2a.client import ClientConfig, ClientFactory
+
+    AgentCard = AgentCard
+    TransportProtocol = TransportProtocol
+    Message = Message
+    ClientConfig = ClientConfig
+    ClientFactory = ClientFactory
+    TaskIdParams = TaskIdParams
+    TaskQueryParams = TaskQueryParams
+except (ImportError, AttributeError):
+    AgentCard = None
+    TransportProtocol = None
+    Message = None
+    ClientConfig = None
+    ClientFactory = None
+    TaskIdParams = None
+    TaskQueryParams = None
+
 
 @typing.runtime_checkable
 class Queryable(Protocol):
@@ -149,6 +180,15 @@ class StreamQueryable(Protocol):
 
 
 @typing.runtime_checkable
+class BidiStreamQueryable(Protocol):
+    """Protocol for Agent Engines that can stream requests and responses."""
+
+    @abc.abstractmethod
+    async def bidi_stream_query(self, **kwargs) -> AsyncIterable[Any]:
+        """Asynchronously stream requests and responses to serve the user query."""
+
+
+@typing.runtime_checkable
 class Cloneable(Protocol):
     """Protocol for Agent Engines that can be cloned."""
 
@@ -170,6 +210,7 @@ _AgentEngineInterface = Union[
     ADKAgent,
     AsyncQueryable,
     AsyncStreamQueryable,
+    BidiStreamQueryable,
     OperationRegistrable,
     Queryable,
     StreamQueryable,
@@ -894,10 +935,12 @@ def _validate_agent_engine_or_raise(
     * a callable method named `query`
     * a callable method named `stream_query`
     * a callable method named `async_stream_query`
+    * a callable method named `bidi_stream_query`
     * a callable method named `register_operations`
 
     Args:
         agent_engine: The agent engine to be validated.
+        logger: The logger to use for logging.
 
     Returns:
         The validated agent engine.
@@ -928,6 +971,9 @@ def _validate_agent_engine_or_raise(
     is_async_stream_queryable = isinstance(
         agent_engine, AsyncStreamQueryable
     ) and callable(agent_engine.async_stream_query)
+    is_bidi_stream_queryable = isinstance(
+        agent_engine, BidiStreamQueryable
+    ) and callable(agent_engine.bidi_stream_query)
     is_operation_registrable = isinstance(
         agent_engine, OperationRegistrable
     ) and callable(agent_engine.register_operations)
@@ -938,11 +984,12 @@ def _validate_agent_engine_or_raise(
         or is_stream_queryable
         or is_operation_registrable
         or is_async_stream_queryable
+        or is_bidi_stream_queryable
     ):
         raise TypeError(
             "agent_engine has none of the following callable methods: "
-            "`query`, `async_query`, `stream_query`, `async_stream_query` or "
-            "`register_operations`."
+            "`query`, `async_query`, `stream_query`, `async_stream_query`, "
+            "`bidi_stream_query` or `register_operations`."
         )
 
     if is_queryable:
@@ -980,6 +1027,16 @@ def _validate_agent_engine_or_raise(
                 "Invalid async_stream_query signature. This might be due to a "
                 " missing `self` argument in the "
                 "agent_engine.async_stream_query method."
+            ) from err
+
+    if is_bidi_stream_queryable:
+        try:
+            inspect.signature(getattr(agent_engine, "bidi_stream_query"))
+        except ValueError as err:
+            raise ValueError(
+                "Invalid bidi_stream_query signature. This might be due to a "
+                " missing `self` argument in the "
+                "agent_engine.bidi_stream_query method."
             ) from err
 
     if is_operation_registrable:
@@ -1521,6 +1578,147 @@ def _wrap_async_stream_query_operation(
     return _method
 
 
+def _wrap_bidi_stream_query_operation(
+    *, method_name: str
+) -> Callable[..., AsyncIterable[Any]]:
+    """Wraps an Agent Engine method, creating an async callable for `bidi_stream_query` API.
+
+    This function creates a callable object that executes the specified
+    Agent Engine method using the `bidi_stream_query` API.  It handles the
+    creation of the API request and the processing of the API response.
+
+    Args:
+        method_name: The name of the Agent Engine method to call.
+
+    Returns:
+        A callable object that executes the method on the Agent Engine via
+        the `bidi_stream_query` API.
+    """
+
+    async def _method(self, **kwargs) -> AsyncIterable[Any]:
+        # Agent Engine bidi streaming query execution should use GenAI SDK Agent
+        # Engine live API client directly.
+        raise NotImplementedError(
+            f"{method_name} is not implemented, please use GenAI SDK Agent "
+            "Enginve live API client instead."
+        )
+
+
+def _wrap_a2a_operation(method_name: str, agent_card: str) -> Callable[..., list]:
+    """Wraps an Agent Engine method, creating a callable for A2A API.
+
+    Args:
+        method_name: The name of the Agent Engine method to call.
+        agent_card: The agent card to use for the A2A API call.
+            Example:
+                {'additionalInterfaces': None,
+                'capabilities': {'extensions': None,
+                'pushNotifications': None,
+                'stateTransitionHistory': None,
+                'streaming': False},
+                'defaultInputModes': ['text'],
+                'defaultOutputModes': ['text'],
+                'description': (
+                    'A helpful assistant agent that can answer questions.'
+                ),
+                'documentationUrl': None,
+                'iconUrl': None,
+                'name': 'Q&A Agent',
+                'preferredTransport': 'JSONRPC',
+                'protocolVersion': '0.3.0',
+                'provider': None,
+                'security': None,
+                'securitySchemes': None,
+                'signatures': None,
+                'skills': [{
+                    'description': (
+                        'A helpful assistant agent that can answer questions.'
+                    ),
+                    'examples': ['Who is leading 2025 F1 Standings?',
+                        'Where can i find an active volcano?'],
+                    'id': 'question_answer',
+                'inputModes': None,
+                'name': 'Q&A Agent',
+                'outputModes': None,
+                'security': None,
+                'tags': ['Question-Answer']}],
+                'supportsAuthenticatedExtendedCard': True,
+                'url': 'http://localhost:8080/',
+                'version': '1.0.0'}
+    Returns:
+        A callable object that executes the method on the Agent Engine via
+        the A2A API.
+    """
+
+    async def _method(self, **kwargs) -> Any:
+        """Wraps an Agent Engine method, creating a callable for A2A API."""
+        a2a_agent_card = AgentCard(**json.loads(agent_card))
+
+        # A2A + AE integration currently only supports Rest API.
+        if (
+            a2a_agent_card.preferred_transport
+            and a2a_agent_card.preferred_transport != TransportProtocol.http_json
+        ):
+            raise ValueError(
+                "Only HTTP+JSON is supported for preferred transport on agent card "
+            )
+
+        # Set preferred transport to HTTP+JSON if not set.
+        if not hasattr(a2a_agent_card, "preferred_transport"):
+            a2a_agent_card.preferred_transport = TransportProtocol.http_json
+
+        # AE cannot support streaming yet. Turn off streaming for now.
+        if a2a_agent_card.capabilities and a2a_agent_card.capabilities.streaming:
+            raise ValueError(
+                "Streaming is not supported in Agent Engine, please change "
+                "a2a_agent_card.capabilities.streaming to False."
+            )
+
+        if not hasattr(a2a_agent_card.capabilities, "streaming"):
+            a2a_agent_card.capabilities.streaming = False
+
+        # agent_card is set on the class_methods before set_up is invoked.
+        # Ensure that the agent_card url is set correctly before the client is created.
+        a2a_agent_card.url = f"https://{initializer.global_config.api_endpoint}/v1beta1/{self.resource_name}/a2a"
+
+        # Using a2a client, inject the auth token from the global config.
+        config = ClientConfig(
+            supported_transports=[
+                TransportProtocol.http_json,
+            ],
+            use_client_preference=True,
+            httpx_client=httpx.AsyncClient(
+                headers={
+                    "Authorization": (
+                        f"Bearer {initializer.global_config.credentials.token}"
+                    )
+                }
+            ),
+        )
+        factory = ClientFactory(config)
+        client = factory.create(a2a_agent_card)
+
+        # kokoro job uses python 3.9, replaced match with if else.
+        if method_name == "on_message_send":
+            response = client.send_message(Message(**kwargs))
+            chunks = []
+            async for chunk in response:
+                chunks.append(chunk)
+            return chunks
+        elif method_name == "on_get_task":
+            response = await client.get_task(TaskQueryParams(**kwargs))
+        elif method_name == "on_cancel_task":
+            response = await client.cancel_task(TaskIdParams(**kwargs))
+        elif method_name == "handle_authenticated_agent_card":
+            response = await client.get_card()
+        else:
+            raise ValueError(f"Unknown method name: {method_name}")
+
+        return response
+
+    return _method
+
+
 def _unregister_api_methods(
     obj: "AgentEngine", operation_schemas: Sequence[_utils.JsonDict]
 ):
@@ -1596,6 +1794,8 @@ def _register_api_methods_or_raise(
             _ASYNC_API_MODE: _wrap_async_query_operation,
             _STREAM_API_MODE: _wrap_stream_query_operation,
             _ASYNC_STREAM_API_MODE: _wrap_async_stream_query_operation,
+            _BIDI_STREAM_API_MODE: _wrap_bidi_stream_query_operation,
+            _A2A_EXTENSION_MODE: _wrap_a2a_operation,
         }
         if isinstance(wrap_operation_fn, dict) and api_mode in wrap_operation_fn:
             # Override the default function with user-specified function if it exists.
@@ -1612,7 +1812,11 @@ def _register_api_methods_or_raise(
             )
 
         # Bind the method to the object.
-        method = _wrap_operation(method_name=method_name)
+        if api_mode == _A2A_EXTENSION_MODE:
+            agent_card = operation_schema.get(_A2A_AGENT_CARD)
+            method = _wrap_operation(method_name=method_name, agent_card=agent_card)
+        else:
+            method = _wrap_operation(method_name=method_name)
         method.__name__ = method_name
         method.__doc__ = method_description
         setattr(obj, method_name, types.MethodType(method, obj))
@@ -1669,6 +1873,13 @@ def _generate_class_methods_spec_or_raise(
     class_methods_spec = []
     for mode, method_names in operations.items():
         for method_name in method_names:
+            if mode == _BIDI_STREAM_API_MODE:
+                _LOGGER.warning(
+                    "Bidi stream API mode is not supported yet in Vertex SDK, "
+                    "please use the GenAI SDK instead. Skipping "
+                    f"method {method_name}."
+                )
+                continue
             if not hasattr(agent_engine, method_name):
                 raise ValueError(
                     f"Method `{method_name}` defined in `register_operations`"
@@ -1684,6 +1895,11 @@ def _generate_class_methods_spec_or_raise(
 
             class_method = _utils.to_proto(schema_dict)
             class_method[_MODE_KEY_IN_SCHEMA] = mode
+            # A2A agent card is a special case, when running in A2A mode,
+            if hasattr(agent_engine, "agent_card"):
+                class_method[_A2A_AGENT_CARD] = getattr(
+                    agent_engine, "agent_card"
+                ).model_dump_json()
             class_methods_spec.append(class_method)
 
     return class_methods_spec

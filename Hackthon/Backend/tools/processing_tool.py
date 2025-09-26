@@ -49,13 +49,13 @@ def process_document(bucket_name: str, file_paths: list[str]) -> dict:
         elif blob_name.lower().endswith(".pdf"):
             file_bytes = blob.download_as_bytes()
             extracted_text = extract_text_from_pdf(file_bytes)
-            print(f"pdf_extracted:",{extracted_text})
+            # print(f"pdf_extracted:",{extracted_text})
         elif blob_name.lower().endswith(".txt"):
             extracted_text = blob.download_as_text()
         elif blob_name.lower().endswith((".ppt", ".pptx")):
             file_bytes = blob.download_as_bytes()
             extracted_text = extract_text_from_ppt(file_bytes)
-            print(f"ppt_extracted:", {extracted_text})
+            # print(f"ppt_extracted:", {extracted_text})
         else:
             extracted_text = f"[Unsupported file type: {blob_name}]"
  

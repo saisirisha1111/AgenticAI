@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV /workspace/AgenticAI/Hackthon/startup_evaluation/myenv
+set -gx VIRTUAL_ENV /workspace/AgenticAI/Hackthon/Backend/myenv
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH
