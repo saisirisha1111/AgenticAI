@@ -29,7 +29,7 @@ logger = logging.getLogger("pipeline_logger")
 
 
 # ===== GCS Config =====
-BUCKET_NAME = "ai-analyst-uploads-files"
+BUCKET_NAME = "ai-analyst-uploads-file"
 storage_client = storage.Client()
 
 # ===== Request Schema =====
@@ -38,13 +38,14 @@ class DocRequest(BaseModel):
     file_paths: list[str]
 
 # ===== System Instruction =====
-# ===== System Instruction =====
+
 instruction = """
 You are a Data Ingestion and Structuring Agent for startup evaluation.
 
 Tasks:
 1. You MUST call the `process_document` tool with the input {"bucket_name": "...", "file_paths": ["..."]}.
-2. Then analyze text and Output must be *only* valid JSON without Markdown or extra text with this schema:
+2. Only after receiving the tool response, you should generate your analysis.
+3. Analyze text recieved from the tool and Output must be *only* valid JSON without Markdown or extra text with this schema:
 
 {
   "startup_name": "string or null",
@@ -56,20 +57,16 @@ Tasks:
     "active_customers": number or null,
     "new_customers_this_month": number or null,
     "average_subscription_price": number or null,
-    "customer_lifespan_months": number or null,
-    "other_metrics": ["string", "string"]
+    "customer_lifespan_months": number or null
   },
   "financials": {
     "ask_amount": number or null,
     "equity_offered": number or null,
-    "implied_valuation": number or null,
     "revenue": number or null,
     "burn_rate": number or null,
     "monthly_expenses": number or null,
     "cash_balance": number or null,
     "marketing_spend": number or null,
-    "customer_acquisition_cost": number or null,
-    "lifetime_value": number or null
   },
   "team": {
     "ceo": "string or null",
@@ -154,63 +151,103 @@ doc_ingest_agent = Agent(
 )
 
 
-# ===== Define the Agent =====
-doc_ingest_agent  = Agent(
-    name="doc_ingest_agent",
-    model="gemini-2.0-flash",
-    instruction=instruction,
-    tools=[process_document],
-)
 
 
-financial_instruction = """
-You are a Financial & Metric Analyst Agent for startup evaluation. Your role is to perform deep financial analysis and benchmarking.
 
-CRITICAL INSTRUCTIONS:
-1. You MUST call the `financial_analysis` tool FIRST before generating any analysis.
-2. The tool requires the structured JSON data from the previous agent as input.
-3. Only after receiving the tool response should you generate your final analysis.
+# financial_instruction = """
+# You are a **Financial Analysis Agent** for startup evaluation. 
+# You must compute, compare, and summarize financial performance based on structured startup data.
 
-Steps:
-1. Call financial_analysis tool with the structured data
-2. Wait for tool response with calculated metrics
-3. Analyze the results against industry benchmarks
-4. Generate final JSON output
+# 🚨 CRITICAL RULES (MUST FOLLOW STRICTLY):
+# 1. You MUST call the `financial_analysis` tool **FIRST** before generating any analysis.
+# 2. The `financial_analysis` tool requires the **structured JSON data** from the previous agent as input.
+# 3. You will receive the structured JSON data from the document ingestion agent - pass this EXACT data to the tool.
+# 4. Wait for the tool response before doing any analysis.
+# 5. After receiving tool results, generate your final JSON output.
 
-{
-  "financial_analysis": {
-    "calculated_metrics": {
-      "annual_revenue": number or null,
-      "implied_valuation": number or null,
-      "revenue_multiple": number or null,
-      "runway_months": number or null
-    },
-    "industry_benchmarks": {
-      "avg_revenue_multiple": number,
-      "avg_ltv_cac_ratio": number,
-      "acceptable_burn_rate": number,
-      "typical_runway": number
-    },
-    "analysis_conclusion": "string",
-    "recommendation": "string",
-    "valuation_assessment": "reasonable | high | low",
-    "risk_factors": ["string", "string"]
-  }
-}
+# ---
 
-Rules:
-- Use exact calculations from the financial_analysis tool.
-- Be objective and data-driven in conclusions.
-- Highlight both strengths and risks.
-- Final output must be valid JSON only.
-"""
+# ### INPUT FORMAT:
+# You will receive structured JSON data like this:
+# {
+#   "startup_name": "string",
+#   "sector": "string", 
+#   "stage": "string",
+#   "traction": {...},
+#   "financials": {...},
+#   "team": {...},
+#   "market": {...},
+#   "product_description": "string",
+#   "document_type": "string"
+# }
 
-financial_analyst_agent = Agent(
-    name="financial_analyst_agent",
-    model="gemini-2.0-flash", 
-    instruction=financial_instruction,
-    tools=[financial_analysis],
-)
+# ### REQUIRED ACTION:
+# 1. Call `financial_analysis` tool with the received structured JSON data
+# 2. Wait for tool response with calculated metrics and benchmarks
+# 3. Generate final output using the tool results
+
+# ---
+
+# ### OUTPUT FORMAT (JSON ONLY):
+# {
+#   "financial_analysis": {
+#     "calculated_metrics": {
+#       "annual_revenue": number or null,
+#       "implied_valuation": number or null, 
+#       "revenue_multiple": number or null,
+#       "runway_months": number or null,
+#       "monthly_net_burn": number or null,
+#       "ltv_cac_ratio": number or null,
+#       "cac": number or null,
+#       "ltv": number or null,
+#       "marketing_efficiency": number or null,
+#       "customer_growth_rate": number or null,
+#       "arpu": number or null
+#     },
+#     "industry_benchmarks": {
+#       "avg_revenue_multiple": number,
+#       "avg_ltv_cac_ratio": number,
+#       "acceptable_burn_rate": number,
+#       "typical_runway": number,
+#       "seed_stage_valuation_range": {"min": number, "max": number},
+#       "data_source": "string",
+#       "query_context": object
+#     },
+#     "investment_analysis": {
+#       "score_breakdown": {
+#         "ltv_cac_ratio": number,
+#         "valuation_range": number,
+#         "runway": number,
+#         "revenue_multiple": number,
+#         "burn_efficiency": number,
+#         "growth_traction": number,
+#         "marketing_efficiency": number
+#       },
+#       "risk_factors": ["string"],
+#       "strengths": ["string"],
+#       "weaknesses": ["string"],
+#       "final_score": number,
+#       "verdict": "string",
+#       "detailed_recommendation": "string"
+#     }
+#   }
+# }
+# ---
+
+# ### FAILSAFE INSTRUCTION:
+# If you do not call the `financial_analysis` tool first, your response will be invalid.
+# DO NOT attempt to calculate metrics manually - ALWAYS use the tool.
+# Your first action MUST be calling the financial_analysis tool with the structured data you received.
+# """
+
+# financial_analyst_agent = Agent(
+#     name="financial_analyst_agent",
+#     model="gemini-2.0-flash", 
+#     instruction=financial_instruction,
+#     tools=[financial_analysis],
+# )
+
+
 
 # recommendation_instruction = """
 # You are the Recommendation & Scoring Agent.
@@ -270,56 +307,14 @@ pipeline = SequentialAgent(
     sub_agents=[doc_ingest_agent, financial_analyst_agent],
 )
 
+
+
 # ===== Session Service =====
 session_service = InMemorySessionService()
 runner = adk.Runner(agent=pipeline, app_name="startup_analysis_app", session_service=session_service)
 
 
 
-# ===== Pipeline Runner Function =====
-# async def run_pipeline(file_json: dict):
-
-#     await session_service.create_session(
-#         app_name="startup_app",
-#         user_id="user123",
-#         session_id="session1"
-#     )
-
-#     content = types.Content(role="user", parts=[types.Part(text=json.dumps(file_json))])
-#     print(content)
-#     final_output = None  # 👈 hold last agent output
-
-#     async for event in runner.run_async(
-#         user_id="user123",
-#         session_id="session1",
-#         new_message=content
-#     ):
-     
-#         if not event.content or not event.content.parts:
-#             continue
-#         # print(event.content.parts)
-#         for part in event.content.parts:         
-#             if part.text:
-#                 raw_text = part.text.strip()
-#                 cleaned_text = re.sub(r"^```json\s*|\s*```$", "", raw_text, flags=re.MULTILINE)
-#                 logger.info(f"[{getattr(event, 'source_agent', 'unknown')}] TEXT: {cleaned_text}")
-#                 final_output = cleaned_text
-
-#             elif part.function_call:
-#                 logger.info(
-#                     f"[{getattr(event, 'source_agent', 'unknown')}] TOOL CALL: "
-#                     f"{part.function_call.name}({part.function_call.args})"
-#                 )
-
-#     # after loop ends, final_output will be from the *last agent*
-#     if not final_output:
-#         return {"error": "Pipeline returned no output"}
-
-#     try:
-#         # Try parsing JSON (for rec agent you expect text, so this will fail safely)
-#         return json.loads(final_output)
-#     except json.JSONDecodeError:
-#         return {"report": final_output}
 
 
 
