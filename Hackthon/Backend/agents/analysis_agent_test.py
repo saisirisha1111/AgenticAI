@@ -17,6 +17,9 @@ from typing import Dict, Any
 import re
 import google.adk as adk
 from google.cloud import bigquery
+import vertexai
+from vertexai.generative_models import GenerativeModel
+import asyncio
 
 # BigQuery Setup
 bq_client = bigquery.Client()
@@ -30,6 +33,10 @@ logger = logging.getLogger("pipeline_logger")
 # ===== GCS Setup =====
 BUCKET_NAME = "ai-analyst-uploads-file"
 storage_client = storage.Client()
+
+vertexai.init(project="ai-analyst-poc-474306", location="us-central1")
+
+model = GenerativeModel("gemini-1.5-flash")
 
 # ===== Request Schema =====
 class DocRequest(BaseModel):
@@ -228,33 +235,204 @@ sio_app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path="ws")
 pending_first_questions: Dict[str, bool] = {}
 
 
-def sanitize_for_bq(data):
+# def sanitize_for_bq(data):
+#     """
+#     Recursively convert strings with numbers to int/float and ensure proper types for BigQuery.
+#     """
+#     if isinstance(data, dict):
+#         for k, v in data.items():
+#             if isinstance(v, str):
+#                 # Remove commas and convert to int/float if numeric
+#                 v_clean = v.replace(',', '')
+#                 if v_clean.isdigit():
+#                     data[k] = int(v_clean)
+#                 else:
+#                     try:
+#                         data[k] = float(v_clean)
+#                     except ValueError:
+#                         data[k] = v  # leave as string
+#             elif isinstance(v, dict) or isinstance(v, list):
+#                 sanitize_for_bq(v)
+#             elif v is None:
+#                 data[k] = None
+#     elif isinstance(data, list):
+#         for i in range(len(data)):
+#             sanitize_for_bq(data[i])
+
+#     print("***************final json*****************",data)
+#     return data
+
+
+async def sanitize_for_bq(data):
     """
-    Recursively convert strings with numbers to int/float and ensure proper types for BigQuery.
+    Recursively process all fields and use LLM to extract structured data 
+    from user answers based on the expected schema types.
     """
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, str):
-                # Remove commas and convert to int/float if numeric
-                v_clean = v.replace(',', '')
-                if v_clean.isdigit():
-                    data[k] = int(v_clean)
+    print("########################################I am in sanitising task")
+    # Define field types based on your schema
+    FIELD_TYPES = {
+        # Numeric fields
+        "numeric": {
+            "traction.current_mrr", "traction.active_customers", "traction.new_customers_this_month",
+            "traction.average_subscription_price", "traction.customer_lifespan_months",
+            "financials.ask_amount", "financials.equity_offered", "financials.revenue",
+            "financials.burn_rate", "financials.monthly_expenses", "financials.cash_balance",
+            "financials.marketing_spend"
+        },
+        # String fields that should be concise
+        "concise_string": {
+            "team.ceo", "team.cto", "market.target_market"
+        },
+        # Descriptive fields that might need summarization
+        "descriptive": {
+            "traction.mrr_growth_trend", "market.market_size_claim"
+        }
+       
+    }
+    
+    async def extract_structured_value(text: str, field_path: str) -> any:
+        """Use LLM to extract structured data based on field type"""
+        try:
+            field_type = None
+            for type_name, fields in FIELD_TYPES.items():
+                if field_path in fields:
+                    field_type = type_name
+                    break
+            
+            if not field_type:
+                return text  # Unknown field type, return as is
+            
+            if field_type == "numeric":
+                prompt = f"""
+                Extract the exact numeric value from the following text. 
+                Return ONLY the number without any units, currency symbols, or additional text.
+                If no clear number is found, return 0.
+                
+                Text: {text}
+                
+                Number:
+                """
+            elif field_type == "concise_string":
+                prompt = f"""
+                Extract the most essential information from the following text for field '{field_path}'.
+                Remove any explanations, opinions, or unnecessary details. 
+                Keep only the core factual information in 1-3 words if possible.
+                
+                Text: {text}
+                
+                Extracted information:
+                """
+            elif field_type == "descriptive":
+                prompt = f"""
+                Summarize the following text for field '{field_path}' into 1-2 concise sentences.
+                Extract only the key factual information, removing fluff and unnecessary details.
+                
+                Text: {text}
+                
+                Summary:
+                """
+            else:
+                return text
+            
+            
+            response = await model.generate_content_async(prompt)            
+            result = response.text.strip()
+            
+            # Post-process based on field type
+            if field_type == "numeric":
+                # Clean and convert the numeric result
+                result_clean = result.replace(',', '').replace('$', '').replace('%', '').strip()
+                if result_clean.replace('.', '').isdigit():
+                    if '.' in result_clean:
+                        return float(result_clean)
+                    else:
+                        return int(result_clean)
                 else:
-                    try:
-                        data[k] = float(v_clean)
-                    except ValueError:
-                        data[k] = v  # leave as string
-            elif isinstance(v, dict) or isinstance(v, list):
-                sanitize_for_bq(v)
-            elif v is None:
-                data[k] = None
-    elif isinstance(data, list):
-        for i in range(len(data)):
-            sanitize_for_bq(data[i])
+                    return 0
+            
+            return result if result else text
+            
+        except Exception as e:
+            logger.error(f"LLM processing error for field {field_path}: {e}")
+            return text
 
-    print("***************final json*****************",data)
-    return data
+    async def process_array_items(items: list, field_path: str) -> list:
+        """Process each item in an array"""
+        processed_items = []
+        for item in items:
+            if isinstance(item, str) and len(item) > 50:
+                processed_item = await extract_structured_value(item, field_path)
+                processed_items.append(processed_item)
+            else:
+                processed_items.append(item)
+        return processed_items
 
+    async def sanitize_recursive(obj, current_path=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_path = f"{current_path}.{key}" if current_path else key
+                if isinstance(value, str):
+                    # Only process if it's a potentially long answer
+                    if len(value) > 30:  # Process answers longer than 30 chars
+                        obj[key] = await extract_structured_value(value, new_path)
+                    else:
+                        # Still try numeric conversion for short strings
+                        value_clean = value.replace(',', '')
+                        if value_clean.isdigit():
+                            obj[key] = int(value_clean)
+                        else:
+                            try:
+                                obj[key] = float(value_clean)
+                            except ValueError:
+                                obj[key] = value
+                elif isinstance(value, dict):
+                    await sanitize_recursive(value, new_path)
+                elif isinstance(value, list):
+                    obj[key] = await process_array_items(value, new_path)
+                elif value is None:
+                    obj[key] = None
+        elif isinstance(obj, list):
+            for i in range(len(obj)):
+                await sanitize_recursive(obj[i], current_path)
+        
+        return obj
+
+    # Run the async sanitization
+    result = await sanitize_recursive(data)
+    
+    print("***************final json*****************", result)
+    return result
+
+
+async def emit_next_question(user_email):
+    if filler_agent.questions:
+        key, question = next(iter(filler_agent.questions.items()))
+        audio_b64 = synthesize_speech_base64(question)
+        await sio.emit("new_question", {"key": key, "text": question, "audio_b64": audio_b64}, room=user_email)
+    else:
+        # Await the async sanitize function
+        final_data = await sanitize_for_bq(filler_agent.structured_json)
+        print("*****************************",final_data)
+
+        record = {
+            "founder_email": user_email,
+            "data": json.dumps(final_data),
+            "created_at": datetime.utcnow().isoformat()
+        }
+
+        # Insert into BigQuery
+        table_id = f"{bq_client.project}.{DATASET}.{TABLE}"
+        try:
+            errors = bq_client.insert_rows_json(table_id, [record])
+            if errors:
+                print("❌ BigQuery Insert Errors:", errors)
+            else:
+                print("✅ Data inserted into BigQuery")
+        except Exception as e:
+            print("❌ Exception inserting into BigQuery:", e)
+
+        # Send success message to frontend
+        await sio.emit("final_json", {"status": "success", "message": "Startup details updated successfully"}, room=user_email)
 
 
 @app.on_event("startup")
