@@ -1,6 +1,6 @@
 FROM python:3.12.11
 
-# Set working directory
+# Set working directorys
 WORKDIR /app
 
 # Copy requirement file
